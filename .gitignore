@@ -1,0 +1,33 @@
+# Omniport
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Archives (test data)
+omniport-archive/
+omniport-test-archive/
+*.tar.gz
+*.zip
+
+# Build artifacts
+build/
+dist/
+*.iso
+*.img
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data
+/tmp/opencode/
