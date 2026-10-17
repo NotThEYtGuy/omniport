@@ -56,15 +56,19 @@ The archive is a plain directory:
 A PyQt6 graphical interface for the Capture → Prepare stage:
 
 ```bash
-python3 prep_ui.py
+python3 prep_ui.py        # Simple UI
+python3 wizard_ui.py      # Step-by-step wizard (recommended)
 ```
 
 The UI provides:
 - System summary (OS, package manager, package count, file count, sizes)
 - Capture options (files, app data, SSH keys, packages, Flatpak, Snap)
+- File browser with preview
 - Destination picker
 - Progress bar during archive creation
 - Build completion summary
+
+## Design decisions
 
 - **Storage-optimized backup.** We chose a file-level home-directory backup
   plus an installed-app inventory over a full disk image: it keeps the archive
@@ -76,19 +80,20 @@ The UI provides:
 - **Safe by default.** The restore flow moves anything it is about to replace
   into the archive's `backup/` folder before copying, so a restore is
   recoverable.
-- **Three-tier safety policy (designed, not yet enforced in code).**
+- **Three-tier safety policy.** Implemented in the CLI:
   - *Safe to migrate*: personal files, app data, browser profiles, documents,
-    desktop preferences.
-  - *Needs translation*: packages, services, drivers, system configuration —
-    handled via per-package install/skip/alternative flow.
+    desktop preferences — auto-restored.
+  - *Needs confirmation*: SSH/GPG keys, browser profiles with passwords —
+    interactive prompt, safe default is skip.
   - *Don't migrate automatically*: kernel, bootloader config, hardware-specific
-    drivers, `/etc` wholesale.
+    drivers, `/etc` wholesale — never restored.
+- **Package translation (preview).** Best-effort alias table for offline preview.
+  Authoritative resolution happens in the ISO using the target distro's package
+  manager.
 
 ## Not implemented yet
 
 - The bootable ISO itself (live environment carrying the archive + wizard).
-- Step-by-step wizard UI (the CLI is the reference implementation of the core
-  flow; the wizard will be layered on top of the same planning logic).
 - Distro-agnostic migration USB (the "one permanent USB" concept).
 - Demo mode, integrated with DistroSea (distrosea.com) for trying a distro
   before committing to it.
@@ -120,7 +125,7 @@ The UI provides:
 
 Clone and contribute:
 ```bash
-git clone https://github.com/YOUR_USERNAME/omniport.git
+git clone https://github.com/NotThEYtGuy/omniport.git
 cd omniport
 python3 wizard_ui.py  # Test the prep UI
 ```
