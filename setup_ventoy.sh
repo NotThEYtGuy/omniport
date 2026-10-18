@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # setup_ventoy.sh — automate Ventoy + Omniport integration
 #
-# Sets up a USB drive with Ventoy + Omniport for testing.
-# REQUIRES: explicit device argument, shows plan before making changes.
+# Fully self-contained: no external downloads. Assumes Ventoy is already
+# available on the system (in PATH, /opt/ventoy, or bundled in the repo).
 #
-# Usage (fully automated):
+# Usage:
 #   ./setup_ventoy.sh /dev/sdX [--dry-run]
 #
 # Example:
@@ -15,6 +15,8 @@ set -euo pipefail
 
 log() { echo "[setup] $*"; }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -23,7 +25,7 @@ DEVICE="${1:-}"
 DRY_RUN=false
 
 if [ -z "$DEVICE" ]; then
-    echo "Usage (fully automated): $0 /dev/sdX [--dry-run]"
+    echo "Usage: $0 /dev/sdX [--dry-run]"
     echo ""
     echo "Available disks:"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL 2>/dev/null | grep disk
@@ -49,7 +51,6 @@ if [ "$DEVICE" = "/dev/$SYSTEM_DISK" ]; then
     exit 1
 fi
 
-DEV_NAME=$(basename "$DEVICE")
 DEV_SIZE=$(lsblk -rn -o SIZE "$DEVICE" 2>/dev/null | head -1)
 
 log "Target device: $DEVICE ($DEV_SIZE)"
@@ -57,16 +58,61 @@ log "Mode: $([ "$DRY_RUN" = true ] && echo "DRY RUN (no changes)" || echo "LIVE"
 echo ""
 
 # ---------------------------------------------------------------------------
+# Find Ventoy (no downloads)
+# ---------------------------------------------------------------------------
+
+find_ventoy() {
+    # Check common locations
+    for dir in "$SCRIPT_DIR/ventoy" /opt/ventoy /usr/local/ventoy "$HOME/ventoy"; do
+        if [ -f "$dir/Ventoy2Disk.sh" ]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    # Check PATH
+    if command -v Ventoy2Disk.sh &>/dev/null; then
+        dirname "$(command -v Ventoy2Disk.sh)"
+        return 0
+    fi
+    # Check if ventoy is installed as a package
+    if command -v ventoy &>/dev/null; then
+        echo "$(dirname "$(command -v ventoy)")"
+        return 0
+    fi
+    return 1
+}
+
+VENTOY_DIR=$(find_ventoy) || {
+    log "ERROR: Ventoy not found."
+    echo ""
+    echo "Ventoy must be available locally (no downloads). Options:"
+    echo "  1. Download Ventoy from https://github.com/ventoy/Ventoy/releases"
+    echo "     and extract to: $SCRIPT_DIR/ventoy/ or /opt/ventoy/"
+    echo "  2. Install via your package manager if available"
+    echo "  3. Place Ventoy2Disk.sh in PATH"
+    echo ""
+    echo "Expected: Ventoy2Disk.sh in one of:"
+    echo "  - $SCRIPT_DIR/ventoy/"
+    echo "  - /opt/ventoy/"
+    echo "  - /usr/local/ventoy/"
+    echo "  - ~/ventoy/"
+    exit 1
+}
+
+log "Found Ventoy at: $VENTOY_DIR"
+
+# ---------------------------------------------------------------------------
 # Show plan
 # ---------------------------------------------------------------------------
 
 echo "=== SETUP PLAN ==="
 echo "Device: $DEVICE ($DEV_SIZE)"
+echo "Ventoy: $VENTOY_DIR"
 echo ""
 echo "This will:"
 echo "  1. Install Ventoy on $DEVICE (creates boot + ISO + data partitions)"
 echo "  2. Copy omniport tools to the data partition"
-echo "  3. (Optional) Copy omniport-live ISO if available"
+echo "  3. Copy omniport-live ISO if available (or any ISO in project dir)"
 echo ""
 echo "ALL DATA ON $DEVICE WILL BE ERASED!"
 echo ""
@@ -76,29 +122,8 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
-log "Proceeding with automatic setup (no confirmation needed)..."
-
 # ---------------------------------------------------------------------------
-# 1. Download Ventoy if not present
-# ---------------------------------------------------------------------------
-
-VENTOY_DIR="/tmp/opencode/ventoy"
-VENTOY_VERSION="1.0.99"
-
-if [ ! -f "$VENTOY_DIR/Ventoy2Disk.sh" ]; then
-    log "Downloading Ventoy v$VENTOY_VERSION..."
-    mkdir -p "$VENTOY_DIR"
-    cd /tmp/opencode
-    wget -q "https://github.com/ventoy/Ventoy/releases/download/v$VENTOY_VERSION/ventoy-$VENTOY_VERSION-linux.tar.gz" -O ventoy.tar.gz
-    tar -xf ventoy.tar.gz -C "$VENTOY_DIR" --strip-components=1
-    cd /home/casaos/project
-    log "Ventoy downloaded."
-else
-    log "Ventoy already downloaded."
-fi
-
-# ---------------------------------------------------------------------------
-# 2. Install Ventoy
+# 1. Install Ventoy
 # ---------------------------------------------------------------------------
 
 log "Installing Ventoy on $DEVICE..."
@@ -109,7 +134,7 @@ sleep 3
 udevadm settle 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 3. Detect and mount partitions
+# 2. Detect and mount partitions
 # ---------------------------------------------------------------------------
 
 ISO_PART=""
@@ -124,7 +149,6 @@ for dev in $(lsblk -rn -o NAME,TYPE "$DEVICE" | awk '$2=="part"{print "/dev/"$1}
     fi
 done
 
-# If no data partition found by label, use the last partition
 if [ -z "$DATA_PART" ]; then
     DATA_PART=$(lsblk -rn -o NAME,TYPE "$DEVICE" | awk '$2=="part"{print "/dev/"$1}' | tail -1)
 fi
@@ -132,8 +156,10 @@ fi
 log "ISO partition: $ISO_PART"
 log "Data partition: $DATA_PART"
 
-# Mount ISO partition
 ISO_MOUNT=""
+DATA_MOUNT=""
+
+# Mount ISO partition
 for mp in /media/casaos/* /tmp/opencode/*; do
     if mountpoint -q "$mp" 2>/dev/null; then
         dev=$(findmnt -n -o SOURCE "$mp" 2>/dev/null)
@@ -147,12 +173,12 @@ done
 if [ -z "$ISO_MOUNT" ]; then
     ISO_MOUNT="/tmp/opencode/ventoy-iso"
     mkdir -p "$ISO_MOUNT"
-    udisksctl mount -b "$ISO_PART" 2>/dev/null || sudo mount "$ISO_PART" "$ISO_MOUNT" 2>/dev/null || true
+    udisksctl mount -b "$ISO_PART" 2>/dev/null || true
+    ISO_MOUNT=$(findmnt -n -o TARGET "$ISO_PART" 2>/dev/null || echo "$ISO_MOUNT")
 fi
 log "ISO partition mounted at $ISO_MOUNT"
 
 # Mount data partition
-DATA_MOUNT=""
 for mp in /media/casaos/* /tmp/opencode/*; do
     if mountpoint -q "$mp" 2>/dev/null; then
         dev=$(findmnt -n -o SOURCE "$mp" 2>/dev/null)
@@ -166,12 +192,13 @@ done
 if [ -z "$DATA_MOUNT" ]; then
     DATA_MOUNT="/tmp/opencode/ventoy-data"
     mkdir -p "$DATA_MOUNT"
-    udisksctl mount -b "$DATA_PART" 2>/dev/null || sudo mount "$DATA_PART" "$DATA_MOUNT" 2>/dev/null || true
+    udisksctl mount -b "$DATA_PART" 2>/dev/null || true
+    DATA_MOUNT=$(findmnt -n -o TARGET "$DATA_PART" 2>/dev/null || echo "$DATA_MOUNT")
 fi
 log "Data partition mounted at $DATA_MOUNT"
 
 # ---------------------------------------------------------------------------
-# 4. Set up omniport on data partition
+# 3. Set up omniport on data partition
 # ---------------------------------------------------------------------------
 
 if [ -n "$DATA_MOUNT" ] && mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
@@ -179,7 +206,6 @@ if [ -n "$DATA_MOUNT" ] && mountpoint -q "$DATA_MOUNT" 2>/dev/null; then
     mkdir -p "$DATA_MOUNT/omniport-tools"
     mkdir -p "$DATA_MOUNT/omniport-archive"
 
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     for f in omniport.py prep_ui.py wizard_ui.py omniport-restore.sh; do
         if [ -f "$SCRIPT_DIR/$f" ]; then
             cp "$SCRIPT_DIR/$f" "$DATA_MOUNT/omniport-tools/"
@@ -192,12 +218,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Copy ISO (if available)
+# 4. Copy ISO (if available)
 # ---------------------------------------------------------------------------
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ISO_FILE=""
-for f in "$SCRIPT_DIR"/omniport-live-*.iso; do
+for f in "$SCRIPT_DIR"/omniport-live-*.iso "$SCRIPT_DIR"/*.iso; do
     [ -f "$f" ] && ISO_FILE="$f" && break
 done
 
@@ -206,12 +231,13 @@ if [ -n "$ISO_FILE" ] && [ -n "$ISO_MOUNT" ] && mountpoint -q "$ISO_MOUNT" 2>/de
     cp "$ISO_FILE" "$ISO_MOUNT/"
     log "ISO copied."
 else
-    log "No omniport-live ISO found. Build one with: ./build_iso.sh 1.0"
-    log "Or download a live distro ISO and copy it to: $ISO_MOUNT/"
+    log "No ISO found in project dir."
+    log "Download a live distro ISO and copy it to: $ISO_MOUNT/"
+    log "Or build one: ./build_iso.sh 1.0"
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Summary
+# 5. Summary
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -222,6 +248,5 @@ log "Data partition: $DATA_MOUNT"
 echo ""
 log "Next steps:"
 log "  1. Build a migration archive: python3 wizard_ui.py → select $DATA_MOUNT"
-log "  2. (Optional) Build live ISO: ./build_iso.sh 1.0 → copy to $ISO_MOUNT/"
-log "  3. Boot from USB → Ventoy menu → select omniport-live ISO"
-log "  4. Restore wizard launches automatically"
+log "  2. (Optional) Download a live ISO → copy to $ISO_MOUNT/"
+log "  3. Boot from USB → Ventoy menu → select ISO → restore wizard launches"
