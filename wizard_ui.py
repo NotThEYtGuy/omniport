@@ -43,27 +43,33 @@ import platform
 class ScanWorker(QThread):
     finished = pyqtSignal(dict)
     error = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
     def run(self):
         try:
             home = omniport.home_dir()
+            self.progress.emit("Detecting package manager...")
             mgr = omniport.detect_package_manager()
+            self.progress.emit("Inventorying installed apps (this may take a moment)...")
             packages = omniport.installed_packages()
 
+            self.progress.emit("Counting files...")
             file_count = 0
             total_size = 0
             cache_size = 0
-            for entry in home.iterdir():
+            top_entries = list(home.iterdir())
+            for i, entry in enumerate(top_entries):
+                self.progress.emit(f"Scanning: {entry.name}/ ({i + 1}/{len(top_entries)})")
                 if entry.name == ".cache":
                     cache_size += omniport._dir_size(entry)
                     continue
-                # Count files but don't walk into huge dirs deeply
                 try:
-                    for p in entry.rglob("*"):
-                        if p.is_file():
+                    for dirpath, dirnames, filenames in os.walk(str(entry)):
+                        dirnames[:] = [d for d in dirnames if d not in (".cache",)]
+                        for f in filenames:
                             file_count += 1
                             try:
-                                total_size += p.stat().st_size
+                                total_size += os.path.getsize(os.path.join(dirpath, f))
                             except OSError:
                                 pass
                 except (PermissionError, OSError):
@@ -350,8 +356,12 @@ class SystemInfoPage(QWizardPage):
         self.scan_worker = ScanWorker()
         self.scan_worker.finished.connect(self.on_scan_done)
         self.scan_worker.error.connect(self.on_scan_error)
+        self.scan_worker.progress.connect(self.on_scan_progress)
         self.scan_worker.start()
         self.info_label.setText("Scanning system...")
+
+    def on_scan_progress(self, msg):
+        self.info_label.setText(msg)
 
     def on_scan_done(self, result):
         self.scan_result = result
@@ -445,11 +455,16 @@ class FileSelectPage(QWizardPage):
         self.tree.clear()
         root_item = QTreeWidgetItem(self.tree, [str(home), "", "folder"])
         root_item.setCheckState(0, Qt.CheckState.Checked)
-        root_item.setExpanded(True)
-        self._populate_tree(root_item, home)
+        root_item.setData(0, Qt.ItemDataRole.UserRole, str(home))
+        root_item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
         self.tree.addTopLevelItem(root_item)
+        # Populate only top-level children (lazy load rest on expand)
+        self._populate_level(root_item, home)
+        root_item.setExpanded(True)
+        self.tree.itemExpanded.connect(self.on_item_expanded)
 
-    def _populate_tree(self, parent_item, path):
+    def _populate_level(self, parent_item, path):
+        """Populate one level of the tree (lazy loading)."""
         try:
             entries = sorted(path.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower()))
         except PermissionError:
@@ -463,7 +478,9 @@ class FileSelectPage(QWizardPage):
                 item = QTreeWidgetItem(parent_item, [entry.name, "", "folder"])
                 item.setCheckState(0, Qt.CheckState.Checked)
                 item.setData(0, Qt.ItemDataRole.UserRole, str(entry))
-                self._populate_tree(item, entry)
+                # Add a placeholder child so the expand arrow shows
+                placeholder = QTreeWidgetItem(item, ["Loading...", "", ""])
+                item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
             else:
                 size = ""
                 try:
@@ -479,6 +496,16 @@ class FileSelectPage(QWizardPage):
                 item = QTreeWidgetItem(parent_item, [entry.name, size, "file"])
                 item.setCheckState(0, Qt.CheckState.Checked)
                 item.setData(0, Qt.ItemDataRole.UserRole, str(entry))
+
+    def on_item_expanded(self, item):
+        """Lazy-load children when a folder is expanded."""
+        # Check if already populated (more than just placeholder)
+        if item.childCount() == 1 and item.child(0).text(0) == "Loading...":
+            # Remove placeholder
+            item.removeChild(item.child(0))
+            path_str = item.data(0, Qt.ItemDataRole.UserRole)
+            if path_str:
+                self._populate_level(item, Path(path_str))
 
     def on_file_selected(self):
         items = self.tree.selectedItems()
@@ -529,26 +556,27 @@ class FileSelectPage(QWizardPage):
             self._set_check_state_recursive(item.child(i), state)
 
     def get_selected_files(self):
+        """Return set of selected top-level entries, or None if all selected.
+        
+        With lazy loading, we track selection at the folder level.
+        If a folder is checked, all its contents are included.
+        """
         selected = set()
         root = self.tree.invisibleRootItem()
-        self._collect_checked(root, selected, "")
-        all_checked = all(
-            root.child(i).checkState(0) == Qt.CheckState.Checked
-            for i in range(root.childCount())
-        )
-        if all_checked and len(selected) > 100:
-            return None
-        return selected
-
-    def _collect_checked(self, item, selected, prefix):
-        for i in range(item.childCount()):
-            child = item.child(i)
-            name = child.text(0)
-            rel = f"{prefix}/{name}" if prefix else name
+        all_checked = True
+        for i in range(root.childCount()):
+            child = root.child(i)
             if child.checkState(0) == Qt.CheckState.Checked:
-                if child.childCount() == 0:
-                    selected.add(rel)
-            self._collect_checked(child, selected, rel)
+                selected.add(child.text(0))
+            elif child.checkState(0) == Qt.CheckState.Unchecked:
+                all_checked = False
+            else:
+                all_checked = False
+                selected.add(child.text(0))  # Partially checked
+
+        if all_checked and len(selected) == root.childCount():
+            return None  # All selected
+        return selected
 
 
 class PackageSelectPage(QWizardPage):
