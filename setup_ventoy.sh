@@ -4,7 +4,7 @@
 # Sets up a USB drive with Ventoy + Omniport for testing.
 # REQUIRES: explicit device argument, shows plan before making changes.
 #
-# Usage:
+# Usage (fully automated):
 #   ./setup_ventoy.sh /dev/sdX [--dry-run]
 #
 # Example:
@@ -23,7 +23,7 @@ DEVICE="${1:-}"
 DRY_RUN=false
 
 if [ -z "$DEVICE" ]; then
-    echo "Usage: $0 /dev/sdX [--dry-run]"
+    echo "Usage (fully automated): $0 /dev/sdX [--dry-run]"
     echo ""
     echo "Available disks:"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL 2>/dev/null | grep disk
@@ -76,11 +76,7 @@ if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
-read -p "Type 'YES' to confirm: " confirm
-if [ "$confirm" != "YES" ]; then
-    log "Aborted."
-    exit 0
-fi
+log "Proceeding with automatic setup (no confirmation needed)..."
 
 # ---------------------------------------------------------------------------
 # 1. Download Ventoy if not present
