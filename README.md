@@ -18,7 +18,7 @@ This repository contains the first working slice of the idea:
 - `design.md` — the architecture, decisions and roadmap.
 - `omniport.py` — cross-platform build / preview / restore tool (stdlib only).
 - `prep_ui.py` — PyQt6 desktop UI for the Capture → Prepare stage.
-- `wizard_ui.py` — step-by-step wizard (4 pages: system info, file selection, package selection, destination & build).
+- `wizard_ui.py` — step-by-step wizard (5 pages: system info, file selection, package selection, destination & build, USB setup).
 - `omniport-restore.sh` — runs inside the live ISO to detect Ventoy data partition and launch restore.
 - `build_iso.sh` — builds the omniport live ISO using Debian live-build.
 
@@ -62,11 +62,10 @@ python3 wizard_ui.py      # Step-by-step wizard (recommended)
 
 The UI provides:
 - System summary (OS, package manager, package count, file count, sizes)
-- Capture options (files, app data, SSH keys, packages, Flatpak, Snap)
-- File browser with preview
-- Destination picker
-- Progress bar during archive creation
-- Build completion summary
+- File browser with preview (select/deselect individual files)
+- Package selection (grouped by source)
+- Destination picker + build with progress
+- USB setup (detect drives, install Ventoy, copy tools)
 
 ## Design decisions
 

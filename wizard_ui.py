@@ -6,6 +6,7 @@ A multi-page wizard that guides the user through:
   2. Select Files         — browse home tree, pick what to include, preview contents
   3. Select Packages      — choose which installed apps to carry over
   4. Destination & Build  — pick where to save, build the archive
+  5. USB Setup            — install Ventoy, copy tools, prepare for boot
 
 Usage:
     python3 wizard_ui.py
@@ -14,6 +15,7 @@ Usage:
 import os
 import sys
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -23,7 +25,8 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QGroupBox, QTextEdit, QSplitter,
     QScrollArea, QWidget, QSizePolicy, QRadioButton, QButtonGroup,
     QFileDialog as QFD, QMessageBox, QFrame, QHeaderView,
-    QAbstractItemView, QLineEdit, QComboBox,
+    QAbstractItemView, QLineEdit, QComboBox, QTableWidget,
+    QTableWidgetItem, QHeaderView as QH,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QColor, QBrush
@@ -92,8 +95,8 @@ class BuildWorker(QThread):
     def __init__(self, dest_path, selected_files, selected_packages):
         super().__init__()
         self.dest_path = dest_path
-        self.selected_files = selected_files  # set of relative paths (or None = all)
-        self.selected_packages = selected_packages  # set of package names (or None = all)
+        self.selected_files = selected_files
+        self.selected_packages = selected_packages
 
     def run(self):
         try:
@@ -108,9 +111,7 @@ class BuildWorker(QThread):
             for entry in entries:
                 if entry.name == ".cache":
                     continue
-                # Check if this top-level entry is selected
                 if self.selected_files is not None:
-                    # Only copy if at least one file under this entry is selected
                     has_selected = any(
                         f.startswith(entry.name + "/") or f == entry.name
                         for f in self.selected_files
@@ -174,6 +175,133 @@ class BuildWorker(QThread):
             self.error.emit(str(e))
 
 
+class USBScanWorker(QThread):
+    """Detect USB drives and their Ventoy status."""
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            drives = []
+            # Get system disk to exclude
+            system_disk = ""
+            try:
+                system_part = __import__("subprocess").run(
+                    ["findmnt", "-n", "-o", "SOURCE", "/"],
+                    capture_output=True, text=True
+                ).stdout.strip()
+                import os as _os
+                system_disk = _os.path.basename(
+                    __import__("subprocess").run(
+                        ["lsblk", "-rn", "-o", "PKNAME", system_part],
+                        capture_output=True, text=True
+                    ).stdout.strip()
+                )
+            except Exception:
+                pass
+
+            # List all block devices
+            result = __import__("subprocess").run(
+                ["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT"],
+                capture_output=True, text=True
+            )
+            import json as _json
+            data = _json.loads(result.stdout)
+
+            for dev in data.get("blockdevices", []):
+                if dev.get("type") != "disk":
+                    continue
+                name = dev["name"]
+                if name == system_disk:
+                    continue
+                # Skip very small devices (likely not USB)
+                size_str = dev.get("size", "0")
+                # Parse size
+                size_gb = 0
+                if size_str.endswith("G"):
+                    size_gb = float(size_str[:-1])
+                elif size_str.endswith("T"):
+                    size_gb = float(size_str[:-1]) * 1024
+                elif size_str.endswith("M"):
+                    size_gb = float(size_str[:-1]) / 1024
+                if size_gb < 1:
+                    continue
+
+                # Check if Ventoy is installed
+                has_ventoy = False
+                has_iso_part = False
+                has_data_part = False
+                iso_part = ""
+                data_part = ""
+                for child in dev.get("children", []):
+                    label = child.get("label", "") or ""
+                    if label == "Ventoy":
+                        has_ventoy = True
+                        has_iso_part = True
+                        iso_part = f"/dev/{child['name']}"
+                    elif label == "VTOYEFI":
+                        pass
+                    else:
+                        has_data_part = True
+                        data_part = f"/dev/{child['name']}"
+
+                drives.append({
+                    "name": name,
+                    "device": f"/dev/{name}",
+                    "size": size_str,
+                    "size_gb": size_gb,
+                    "has_ventoy": has_ventoy,
+                    "iso_part": iso_part,
+                    "data_part": data_part,
+                    "has_data_part": has_data_part,
+                })
+
+            self.finished.emit(drives)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class VentoySetupWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+
+    def run(self):
+        try:
+            script_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "setup_ventoy.sh"
+            )
+            if not os.path.exists(script_path):
+                self.error.emit(f"setup_ventoy.sh not found at {script_path}")
+                return
+
+            self.progress.emit(f"Running setup on {self.device}...")
+            proc = subprocess.Popen(
+                ["bash", script_path, self.device],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            output = []
+            for line in proc.stdout:
+                line = line.rstrip()
+                output.append(line)
+                self.progress.emit(line)
+            proc.wait()
+
+            if proc.returncode == 0:
+                self.finished.emit("\n".join(output))
+            else:
+                self.error.emit(f"Setup failed (exit {proc.returncode}):\n" + "\n".join(output))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 # ---------------------------------------------------------------------------
 # Wizard pages
 # ---------------------------------------------------------------------------
@@ -187,7 +315,7 @@ class SystemInfoPage(QWizardPage):
         layout = QVBoxLayout(self)
 
         self.info_label = QLabel("Scanning...")
-        self.info_label.setFont(__import__("PyQt6.QtGui", fromlist=["QFont"]).QFont("Monospace", 10))
+        self.info_label.setFont(QFont("Monospace", 10))
         self.info_label.setWordWrap(True)
         layout.addWidget(self.info_label)
 
@@ -237,10 +365,8 @@ class FileSelectPage(QWizardPage):
 
         layout = QVBoxLayout(self)
 
-        # Splitter: tree on left, preview on right
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # File tree
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["File / Folder", "Size", "Type"])
         self.tree.setColumnWidth(0, 300)
@@ -250,7 +376,6 @@ class FileSelectPage(QWizardPage):
         self.tree.itemSelectionChanged.connect(self.on_file_selected)
         splitter.addWidget(self.tree)
 
-        # Preview panel
         preview_widget = QWidget()
         preview_layout = QVBoxLayout(preview_widget)
         preview_label = QLabel("File Preview")
@@ -268,7 +393,6 @@ class FileSelectPage(QWizardPage):
         splitter.setSizes([400, 300])
         layout.addWidget(splitter)
 
-        # Selection buttons
         btn_layout = QHBoxLayout()
         self.select_all_btn = QPushButton("Select All")
         self.select_all_btn.clicked.connect(self.select_all)
@@ -285,7 +409,7 @@ class FileSelectPage(QWizardPage):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
-        self.selected_files = None  # None = all selected
+        self.selected_files = None
         self._populated = False
 
     def initializePage(self):
@@ -312,7 +436,6 @@ class FileSelectPage(QWizardPage):
             if entry.name == ".cache":
                 continue
             if entry.is_dir():
-                # Check if it's a cache dir
                 if entry.name in ("Caches", "Temp") and path.name in ("Library", "AppData"):
                     continue
                 item = QTreeWidgetItem(parent_item, [entry.name, "", "folder"])
@@ -345,14 +468,12 @@ class FileSelectPage(QWizardPage):
             return
         path = Path(path_str)
         if path.is_file():
-            # Show file info
             try:
                 sz = path.stat().st_size
                 if sz > 1024 * 1024:
                     self.preview_text.setPlainText(f"[File too large to preview: {sz / 1024 / 1024:.1f} MB]")
                     self.preview_info.setText(f"{path.name} — {sz:,} bytes")
                     return
-                # Try to read as text
                 try:
                     content = path.read_text(errors="replace")
                     self.preview_text.setPlainText(content[:50000])
@@ -386,12 +507,9 @@ class FileSelectPage(QWizardPage):
             self._set_check_state_recursive(item.child(i), state)
 
     def get_selected_files(self):
-        """Return set of selected relative paths, or None if all selected."""
         selected = set()
         root = self.tree.invisibleRootItem()
-        # Walk the tree and collect checked items
         self._collect_checked(root, selected, "")
-        # If all top-level items are checked, return None (all)
         all_checked = all(
             root.child(i).checkState(0) == Qt.CheckState.Checked
             for i in range(root.childCount())
@@ -451,7 +569,6 @@ class PackageSelectPage(QWizardPage):
         packages = scan_result["packages"]
         self.info_label.setText(f"Found {len(packages)} installed packages. Select which to carry over.")
 
-        # Group by source
         by_source = {}
         for pkg in packages:
             src = pkg.get("source", "unknown")
@@ -481,7 +598,6 @@ class PackageSelectPage(QWizardPage):
         selected = set()
         root = self.tree.invisibleRootItem()
         self._collect_checked(root, selected)
-        # If all selected, return None
         total = sum(1 for _ in self._all_packages())
         if len(selected) >= total * 0.95:
             return None
@@ -513,7 +629,6 @@ class DestinationBuildPage(QWizardPage):
 
         layout = QVBoxLayout(self)
 
-        # Destination
         dest_group = QGroupBox("Destination")
         dest_layout = QHBoxLayout(dest_group)
         self.dest_label = QLabel("No destination selected")
@@ -525,7 +640,6 @@ class DestinationBuildPage(QWizardPage):
         dest_layout.addWidget(self.dest_button)
         layout.addWidget(dest_group)
 
-        # Progress
         progress_group = QGroupBox("Progress")
         progress_layout = QVBoxLayout(progress_group)
         self.progress_bar = QProgressBar()
@@ -537,7 +651,6 @@ class DestinationBuildPage(QWizardPage):
         progress_layout.addWidget(self.progress_label)
         layout.addWidget(progress_group)
 
-        # Result
         self.result_text = QTextEdit()
         self.result_text.setReadOnly(True)
         self.result_text.setMaximumHeight(150)
@@ -575,7 +688,6 @@ class DestinationBuildPage(QWizardPage):
         self.result_text.clear()
         self.result_text.append("Building archive...")
 
-        # Get selections from previous pages
         file_page = self.wizard().page(1)
         pkg_page = self.wizard().page(2)
         selected_files = file_page.get_selected_files()
@@ -603,6 +715,147 @@ class DestinationBuildPage(QWizardPage):
         QMessageBox.critical(self, "Build Failed", msg)
 
 
+class USBSetupPage(QWizardPage):
+    def __init__(self):
+        super().__init__()
+        self.setTitle("Step 5: USB Setup (Ventoy)")
+        self.setSubTitle("Set up a USB drive with Ventoy + Omniport for booting.")
+
+        layout = QVBoxLayout(self)
+
+        # Drive detection
+        drive_group = QGroupBox("Detected USB Drives")
+        drive_layout = QVBoxLayout(drive_group)
+        self.drive_table = QTableWidget()
+        self.drive_table.setColumnCount(4)
+        self.drive_table.setHorizontalHeaderLabels(["Device", "Size", "Ventoy?", "Status"])
+        self.drive_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.drive_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.drive_table.setMaximumHeight(150)
+        drive_layout.addWidget(self.drive_table)
+
+        self.refresh_btn = QPushButton("Refresh Drives")
+        self.refresh_btn.clicked.connect(self.scan_drives)
+        drive_layout.addWidget(self.refresh_btn)
+        layout.addWidget(drive_group)
+
+        # Setup info
+        self.info_label = QLabel("Click 'Refresh Drives' to detect USB drives.")
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("color: #666;")
+        layout.addWidget(self.info_label)
+
+        # Progress
+        progress_group = QGroupBox("Setup Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setVisible(False)
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("color: #666; font-size: 10px;")
+        progress_layout.addWidget(self.progress_bar)
+        progress_layout.addWidget(self.progress_label)
+        layout.addWidget(progress_group)
+
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setMaximumHeight(150)
+        self.result_text.setStyleSheet("font-family: monospace; font-size: 10px;")
+        layout.addWidget(self.result_text)
+
+        self.setup_button = QPushButton("Set Up USB Drive")
+        self.setup_button.setFont(QFont("Sans", 12, QFont.Weight.Bold))
+        self.setup_button.setMinimumHeight(40)
+        self.setup_button.setEnabled(False)
+        self.setup_button.clicked.connect(self.start_setup)
+        layout.addWidget(self.setup_button)
+
+        self.scan_worker = None
+        self.setup_worker = None
+        self.selected_device = None
+
+    def initializePage(self):
+        self.scan_drives()
+
+    def scan_drives(self):
+        self.info_label.setText("Scanning for USB drives...")
+        self.drive_table.setRowCount(0)
+        self.setup_button.setEnabled(False)
+        self.scan_worker = USBScanWorker()
+        self.scan_worker.finished.connect(self.on_drives_found)
+        self.scan_worker.error.connect(self.on_scan_error)
+        self.scan_worker.start()
+
+    def on_drives_found(self, drives):
+        self.drive_table.setRowCount(len(drives))
+        for i, drive in enumerate(drives):
+            self.drive_table.setItem(i, 0, QTableWidgetItem(drive["device"]))
+            self.drive_table.setItem(i, 1, QTableWidgetItem(drive["size"]))
+            ventoy_status = "✅ Yes" if drive["has_ventoy"] else "❌ No"
+            self.drive_table.setItem(i, 2, QTableWidgetItem(ventoy_status))
+            if drive["has_ventoy"]:
+                status = "Ready (Ventoy installed)"
+            else:
+                status = "Needs setup"
+            self.drive_table.setItem(i, 3, QTableWidgetItem(status))
+
+        if drives:
+            self.info_label.setText(
+                f"Found {len(drives)} USB drive(s). Select one and click 'Set Up USB Drive'.\n"
+                "Note: This will ERASE all data on the selected drive!"
+            )
+        else:
+            self.info_label.setText("No USB drives detected. Plug in a USB drive and click Refresh.")
+
+    def on_scan_error(self, msg):
+        self.info_label.setText(f"Scan error: {msg}")
+
+    def start_setup(self):
+        rows = self.drive_table.selectedItems()
+        if not rows:
+            QMessageBox.warning(self, "No drive selected", "Please select a USB drive first.")
+            return
+
+        row = self.drive_table.currentRow()
+        device = self.drive_table.item(row, 0).text()
+
+        reply = QMessageBox.question(
+            self, "Confirm",
+            f"This will ERASE ALL DATA on {device} and install Ventoy + Omniport.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.setup_button.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.result_text.clear()
+        self.result_text.append(f"Setting up {device}...")
+
+        self.setup_worker = VentoySetupWorker(device)
+        self.setup_worker.progress.connect(self.on_setup_progress)
+        self.setup_worker.finished.connect(self.on_setup_finished)
+        self.setup_worker.error.connect(self.on_setup_error)
+        self.setup_worker.start()
+
+    def on_setup_progress(self, msg):
+        self.progress_label.setText(msg)
+        self.result_text.append(msg)
+
+    def on_setup_finished(self, msg):
+        self.progress_bar.setVisible(False)
+        self.result_text.append("\n" + msg)
+        self.setup_button.setEnabled(True)
+        QMessageBox.information(self, "Setup Complete", "USB drive is ready!")
+
+    def on_setup_error(self, msg):
+        self.progress_bar.setVisible(False)
+        self.result_text.append(f"\nERROR: {msg}")
+        self.setup_button.setEnabled(True)
+        QMessageBox.critical(self, "Setup Failed", msg)
+
+
 # ---------------------------------------------------------------------------
 # Wizard
 # ---------------------------------------------------------------------------
@@ -617,22 +870,17 @@ class OmniportWizard(QWizard):
 
         self.scan_result = None
 
-        # Pages
         self.system_page = SystemInfoPage()
         self.file_page = FileSelectPage()
         self.package_page = PackageSelectPage()
         self.dest_page = DestinationBuildPage()
+        self.usb_page = USBSetupPage()
 
         self.addPage(self.system_page)
         self.addPage(self.file_page)
         self.addPage(self.package_page)
         self.addPage(self.dest_page)
-
-    def _on_scan_done(self, result):
-        self.scan_result = result
-        # Propagate to pages
-        self.file_page.wizard = lambda: self
-        self.package_page.wizard = lambda: self
+        self.addPage(self.usb_page)
 
     @property
     def scan_result(self):
