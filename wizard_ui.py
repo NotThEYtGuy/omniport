@@ -674,7 +674,7 @@ class PackageSelectPage(QWizardPage):
 class DestinationBuildPage(QWizardPage):
     def __init__(self):
         super().__init__()
-        self.setTitle("Step 4: Destination & Build")
+        self.setTitle("Step 5: Destination & Build")
         self.setSubTitle("Choose where to save the migration archive and build it.")
 
         layout = QVBoxLayout(self)
@@ -744,6 +744,10 @@ class DestinationBuildPage(QWizardPage):
         selected_files = file_page.get_selected_files()
         selected_packages = pkg_page.get_selected_packages()
 
+        # If no files explicitly selected, include everything
+        if selected_files is not None and len(selected_files) == 0:
+            selected_files = None
+
         self.build_worker = BuildWorker(self.dest_path, selected_files, selected_packages)
         self.build_worker.progress.connect(self.on_progress)
         self.build_worker.finished.connect(self.on_finished)
@@ -771,7 +775,7 @@ class DestinationBuildPage(QWizardPage):
 class USBSetupPage(QWizardPage):
     def __init__(self):
         super().__init__()
-        self.setTitle("Step 5: USB Setup (Ventoy)")
+        self.setTitle("Step 4: USB Setup (Ventoy)")
         self.setSubTitle("Set up a USB drive with Ventoy + Omniport for booting.")
 
         layout = QVBoxLayout(self)
@@ -928,8 +932,8 @@ class OmniportWizard(QWizard):
         self.addPage(self.system_page)
         self.addPage(self.file_page)
         self.addPage(self.package_page)
-        self.addPage(self.dest_page)
-        self.addPage(self.usb_page)
+        self.addPage(self.usb_page)          # USB setup BEFORE build
+        self.addPage(self.dest_page)         # Build archive on prepared USB
 
     @property
     def scan_result(self):
