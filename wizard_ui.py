@@ -57,13 +57,17 @@ class ScanWorker(QThread):
                 if entry.name == ".cache":
                     cache_size += omniport._dir_size(entry)
                     continue
-                for p in entry.rglob("*"):
-                    if p.is_file():
-                        file_count += 1
-                        try:
-                            total_size += p.stat().st_size
-                        except OSError:
-                            pass
+                # Count files but don't walk into huge dirs deeply
+                try:
+                    for p in entry.rglob("*"):
+                        if p.is_file():
+                            file_count += 1
+                            try:
+                                total_size += p.stat().st_size
+                            except OSError:
+                                pass
+                except (PermissionError, OSError):
+                    pass
             for cache_name in ("Library/Caches", "AppData/Local/Temp"):
                 cp = home / cache_name
                 if cp.exists():
@@ -107,8 +111,10 @@ class BuildWorker(QThread):
             (archive_root / "home").mkdir(parents=True)
 
             files_copied = 0
+            errors = []
             entries = sorted(home.iterdir())
-            for entry in entries:
+            total_entries = len(entries)
+            for idx, entry in enumerate(entries):
                 if entry.name == ".cache":
                     continue
                 if self.selected_files is not None:
@@ -119,19 +125,42 @@ class BuildWorker(QThread):
                     if not has_selected and entry.name not in self.selected_files:
                         continue
 
-                self.progress.emit(f"Copying: {entry.name}/")
-                shutil.copytree(
-                    entry,
-                    archive_root / "home" / entry.name,
-                    symlinks=True,
-                    ignore=omniport._cache_ignored,
-                )
-                for p in (archive_root / "home" / entry.name).rglob("*"):
-                    if p.is_file():
+                self.progress.emit(f"Copying: {entry.name}/ ({idx + 1}/{total_entries})")
+                dest_entry = archive_root / "home" / entry.name
+                try:
+                    if entry.is_symlink():
+                        dest_entry.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            os.symlink(os.readlink(entry), str(dest_entry))
+                        except OSError as e:
+                            errors.append(f"{entry.name}: {e}")
+                            continue
+                    elif entry.is_dir():
+                        shutil.copytree(
+                            entry, dest_entry, symlinks=True,
+                            ignore=omniport._cache_ignored,
+                            dirs_exist_ok=True,
+                        )
+                    else:
+                        shutil.copy2(entry, dest_entry)
+                    # Count files
+                    if dest_entry.is_dir():
+                        for p in dest_entry.rglob("*"):
+                            if p.is_file() or p.is_symlink():
+                                files_copied += 1
+                    elif dest_entry.is_file() or dest_entry.is_symlink():
                         files_copied += 1
+                except Exception as e:
+                    errors.append(f"{entry.name}: {e}")
+                    self.progress.emit(f"  WARNING: {entry.name}: {e}")
 
             self.progress.emit("Inventorying installed apps...")
-            all_packages = omniport.installed_packages()
+            try:
+                all_packages = omniport.installed_packages()
+            except Exception as e:
+                all_packages = []
+                errors.append(f"Package inventory failed: {e}")
+
             if self.selected_packages is not None:
                 packages = [p for p in all_packages if p["name"] in self.selected_packages]
             else:
@@ -164,35 +193,37 @@ class BuildWorker(QThread):
             size = sum(
                 f.stat().st_size for f in archive_root.rglob("*") if f.is_file()
             )
-            self.finished.emit(
+            msg = (
                 f"Archive created successfully!\n"
                 f"  Location: {archive_root}\n"
                 f"  Files: {files_copied}\n"
                 f"  Apps: {len(packages)}\n"
                 f"  Size: {size / 1024 / 1024:.1f} MB"
             )
+            if errors:
+                msg += f"\n  Warnings: {len(errors)}"
+                for e in errors[:5]:
+                    msg += f"\n    - {e}"
+            self.finished.emit(msg)
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(f"Build failed: {e}")
 
 
 class USBScanWorker(QThread):
-    """Detect USB drives and their Ventoy status."""
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
 
     def run(self):
         try:
             drives = []
-            # Get system disk to exclude
             system_disk = ""
             try:
-                system_part = __import__("subprocess").run(
+                system_part = subprocess.run(
                     ["findmnt", "-n", "-o", "SOURCE", "/"],
                     capture_output=True, text=True
                 ).stdout.strip()
-                import os as _os
-                system_disk = _os.path.basename(
-                    __import__("subprocess").run(
+                system_disk = os.path.basename(
+                    subprocess.run(
                         ["lsblk", "-rn", "-o", "PKNAME", system_part],
                         capture_output=True, text=True
                     ).stdout.strip()
@@ -200,13 +231,11 @@ class USBScanWorker(QThread):
             except Exception:
                 pass
 
-            # List all block devices
-            result = __import__("subprocess").run(
+            result = subprocess.run(
                 ["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT"],
                 capture_output=True, text=True
             )
-            import json as _json
-            data = _json.loads(result.stdout)
+            data = json.loads(result.stdout)
 
             for dev in data.get("blockdevices", []):
                 if dev.get("type") != "disk":
@@ -214,9 +243,7 @@ class USBScanWorker(QThread):
                 name = dev["name"]
                 if name == system_disk:
                     continue
-                # Skip very small devices (likely not USB)
                 size_str = dev.get("size", "0")
-                # Parse size
                 size_gb = 0
                 if size_str.endswith("G"):
                     size_gb = float(size_str[:-1])
@@ -227,21 +254,16 @@ class USBScanWorker(QThread):
                 if size_gb < 1:
                     continue
 
-                # Check if Ventoy is installed
                 has_ventoy = False
-                has_iso_part = False
-                has_data_part = False
                 iso_part = ""
                 data_part = ""
+                has_data_part = False
                 for child in dev.get("children", []):
                     label = child.get("label", "") or ""
                     if label == "Ventoy":
                         has_ventoy = True
-                        has_iso_part = True
                         iso_part = f"/dev/{child['name']}"
-                    elif label == "VTOYEFI":
-                        pass
-                    else:
+                    elif label != "VTOYEFI":
                         has_data_part = True
                         data_part = f"/dev/{child['name']}"
 
@@ -664,6 +686,7 @@ class DestinationBuildPage(QWizardPage):
         layout.addWidget(self.build_button)
 
         self.build_worker = None
+        self.build_done = False
 
     def browse_destination(self):
         path = QFileDialog.getExistingDirectory(
@@ -675,7 +698,7 @@ class DestinationBuildPage(QWizardPage):
             self.dest_label.setStyleSheet("color: #000;")
 
     def isComplete(self):
-        return self.dest_path is not None
+        return self.dest_path is not None and self.build_done
 
     def start_build(self):
         if not self.dest_path:
@@ -706,6 +729,8 @@ class DestinationBuildPage(QWizardPage):
         self.progress_bar.setVisible(False)
         self.result_text.append(msg)
         self.build_button.setEnabled(True)
+        self.build_done = True
+        self.completeChanged.emit()
         QMessageBox.information(self, "Build Complete", msg)
 
     def on_error(self, msg):
@@ -723,7 +748,6 @@ class USBSetupPage(QWizardPage):
 
         layout = QVBoxLayout(self)
 
-        # Drive detection
         drive_group = QGroupBox("Detected USB Drives")
         drive_layout = QVBoxLayout(drive_group)
         self.drive_table = QTableWidget()
@@ -739,13 +763,11 @@ class USBSetupPage(QWizardPage):
         drive_layout.addWidget(self.refresh_btn)
         layout.addWidget(drive_group)
 
-        # Setup info
         self.info_label = QLabel("Click 'Refresh Drives' to detect USB drives.")
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("color: #666;")
         layout.addWidget(self.info_label)
 
-        # Progress
         progress_group = QGroupBox("Setup Progress")
         progress_layout = QVBoxLayout(progress_group)
         self.progress_bar = QProgressBar()
@@ -772,7 +794,6 @@ class USBSetupPage(QWizardPage):
 
         self.scan_worker = None
         self.setup_worker = None
-        self.selected_device = None
 
     def initializePage(self):
         self.scan_drives()
@@ -791,7 +812,7 @@ class USBSetupPage(QWizardPage):
         for i, drive in enumerate(drives):
             self.drive_table.setItem(i, 0, QTableWidgetItem(drive["device"]))
             self.drive_table.setItem(i, 1, QTableWidgetItem(drive["size"]))
-            ventoy_status = "✅ Yes" if drive["has_ventoy"] else "❌ No"
+            ventoy_status = "Yes" if drive["has_ventoy"] else "No"
             self.drive_table.setItem(i, 2, QTableWidgetItem(ventoy_status))
             if drive["has_ventoy"]:
                 status = "Ready (Ventoy installed)"
@@ -802,7 +823,7 @@ class USBSetupPage(QWizardPage):
         if drives:
             self.info_label.setText(
                 f"Found {len(drives)} USB drive(s). Select one and click 'Set Up USB Drive'.\n"
-                "Note: This will ERASE all data on the selected drive!"
+                "WARNING: This will ERASE all data on the selected drive!"
             )
         else:
             self.info_label.setText("No USB drives detected. Plug in a USB drive and click Refresh.")
@@ -868,7 +889,7 @@ class OmniportWizard(QWizard):
         self.setMinimumSize(900, 700)
         self.resize(1000, 750)
 
-        self.scan_result = None
+        self._scan_result = None
 
         self.system_page = SystemInfoPage()
         self.file_page = FileSelectPage()
